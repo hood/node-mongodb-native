@@ -1557,472 +1557,75 @@ describe('Change Streams', function () {
       });
     });
   });
-
-  describe('resumability', function () {
-    let client: MongoClient;
-    let collection: Collection;
-    let changeStream: ChangeStream;
-    let aggregateEvents: CommandStartedEvent[] = [];
-
-    const changeStreamResumeOptions: ChangeStreamOptions = {
-      fullDocument: 'updateLookup',
-      collation: { locale: 'en', maxVariable: 'punct' },
-      maxAwaitTimeMS: 20000,
-      batchSize: 200
-    };
-
-    const resumableErrorCodes = [
-      { error: 'HostUnreachable', code: 6 },
-      { error: 'HostNotFound', code: 7 },
-      { error: 'NetworkTimeout', code: 89 },
-      { error: 'ShutdownInProgress', code: 91 },
-      { error: 'PrimarySteppedDown', code: 189 },
-      { error: 'ExceededTimeLimit', code: 262 },
-      { error: 'SocketException', code: 9001 },
-      { error: 'NotWritablePrimary', code: 10107 },
-      { error: 'InterruptedAtShutdown', code: 11600 },
-      { error: 'InterruptedDueToReplStateChange', code: 11602 },
-      { error: 'NotPrimaryNoSecondaryOk', code: 13435 },
-      { error: 'StaleShardVersion', code: 63 },
-      { error: 'StaleEpoch', code: 150 },
-      { error: 'RetryChangeStream', code: 234 },
-      { error: 'FailedToSatisfyReadPreference', code: 133 },
-      { error: 'CursorNotFound', code: 43 }
-    ];
-
-    const is4_2Server = (serverVersion: string) =>
-      gte(serverVersion, '4.2.0') && lt(serverVersion, '4.3.0');
-
-    beforeEach(async function () {
-      const dbName = 'resumabilty_tests';
-      const collectionName = 'foo';
-      const utilClient = this.configuration.newClient();
-      // 3.6 servers do not support creating a change stream on a database that doesn't exist
-      await utilClient
-        .db(dbName)
-        .dropDatabase()
-        .catch(e => e);
-      await utilClient.db(dbName).createCollection(collectionName);
-      await utilClient.close();
-
-      client = this.configuration.newClient({ monitorCommands: true });
-      client.on('commandStarted', filterForCommands(['aggregate'], aggregateEvents));
-      collection = client.db(dbName).collection(collectionName);
-    });
-
-    afterEach(async function () {
-      await changeStream.close();
-      await client.close();
-      aggregateEvents = [];
-    });
-
-    context('iterator api', function () {
-      context('#next', function () {
-        for (const { error, code } of resumableErrorCodes) {
-          it(
-            `resumes on error code ${code} (${error})`,
-            { requires: { topology: '!single', mongodb: '>=4.2' } },
-            async function () {
-              changeStream = collection.watch([]);
-              await initIteratorMode(changeStream);
-
-              await client.db('admin').command({
-                configureFailPoint: is4_2Server(this.configuration.version)
-                  ? 'failCommand'
-                  : 'failGetMoreAfterCursorCheckout',
-                mode: { times: 1 },
-                data: {
-                  failCommands: ['getMore'],
-                  errorCode: code
-                }
-              } as FailPoint);
-
-              await collection.insertOne({ name: 'bailey' });
-
-              const change = await changeStream.next();
-              expect(change).to.have.property('operationType', 'insert');
-
-              expect(aggregateEvents).to.have.lengthOf(2);
-            }
-          );
-        }
-        for (const { error, code } of resumableErrorCodes) {
-          it(
-            `resumes on error code ${code} (${error})`,
-            { requires: { topology: '!single', mongodb: '<4.2' } },
-            async function () {
-              changeStream = collection.watch([]);
-              await initIteratorMode(changeStream);
-
-              // on 3.6 servers, no postBatchResumeToken is sent back in the initial aggregate response.
-              // This means that a resume token isn't cached until the first change has been iterated.
-              // In order to test the resume, we need to ensure that at least one document has
-              // been iterated so we have a resume token to resume on.
-              await collection.insertOne({ name: 'bailey' });
-              await changeStream.next();
-
-              const mock = sinon
-                // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-                .stub(changeStream.cursor.server!, 'getMore')
-                .callsFake((_ns, _cursorId, _options, callback) => {
-                  mock.restore();
-                  const error = new MongoServerError({ message: 'Something went wrong' });
-                  error.code = code;
-                  callback(error);
-                });
-
-              await collection.insertOne({ name: 'bailey' });
-
-              const change = await changeStream.next();
-
-              expect(change).to.have.property('operationType', 'insert');
-              expect(aggregateEvents).to.have.lengthOf(2);
-            }
-          );
-        }
-
-        it(
-          'maintains change stream options on resume',
-          { requires: { topology: '!single', mongodb: '>=4.2' } },
-          async function () {
-            changeStream = collection.watch([], changeStreamResumeOptions);
-            await initIteratorMode(changeStream);
-
-            await client.db('admin').command({
-              configureFailPoint: is4_2Server(this.configuration.version)
-                ? 'failCommand'
-                : 'failGetMoreAfterCursorCheckout',
-              mode: { times: 1 },
-              data: {
-                failCommands: ['getMore'],
-                errorCode: resumableErrorCodes[0].code
-              }
-            } as FailPoint);
-
-            expect(changeStream.cursor)
-              .to.have.property('options')
-              .that.containSubset(changeStreamResumeOptions);
-
-            await collection.insertOne({ name: 'bailey' });
-
-            await changeStream.next();
-
-            expect(changeStream.cursor)
-              .to.have.property('options')
-              .that.containSubset(changeStreamResumeOptions);
-          }
-        );
-
-        context('when the error is not a resumable error', function () {
-          it(
-            'does not resume',
-            { requires: { topology: '!single', mongodb: '>=4.2' } },
-            async function () {
-              changeStream = collection.watch([]);
-
-              const unresumableErrorCode = 1000;
-              await client.db('admin').command({
-                configureFailPoint: is4_2Server(this.configuration.version)
-                  ? 'failCommand'
-                  : 'failGetMoreAfterCursorCheckout',
-                mode: { times: 1 },
-                data: {
-                  failCommands: ['getMore'],
-                  errorCode: unresumableErrorCode
-                }
-              } as FailPoint);
-
-              await initIteratorMode(changeStream);
-
-              await collection.insertOne({ name: 'bailey' });
-
-              const error = await changeStream.next().catch(err => err);
-
-              expect(error).to.be.instanceOf(MongoServerError);
-              expect(aggregateEvents).to.have.lengthOf(1);
-            }
-          );
-        });
-      });
-
-      context('#hasNext', function () {
-        for (const { error, code } of resumableErrorCodes) {
-          it(
-            `resumes on error code ${code} (${error})`,
-            { requires: { topology: '!single', mongodb: '>=4.2' } },
-            async function () {
-              changeStream = collection.watch([]);
-              await initIteratorMode(changeStream);
-
-              await client.db('admin').command({
-                configureFailPoint: is4_2Server(this.configuration.version)
-                  ? 'failCommand'
-                  : 'failGetMoreAfterCursorCheckout',
-                mode: { times: 1 },
-                data: {
-                  failCommands: ['getMore'],
-                  errorCode: code
-                }
-              } as FailPoint);
-
-              await collection.insertOne({ name: 'bailey' });
-
-              const hasNext = await changeStream.hasNext();
-              expect(hasNext).to.be.true;
-
-              expect(aggregateEvents).to.have.lengthOf(2);
-            }
-          );
-        }
-
-        for (const { error, code } of resumableErrorCodes) {
-          it(
-            `resumes on error code ${code} (${error})`,
-            { requires: { topology: '!single', mongodb: '<4.2' } },
-            async function () {
-              changeStream = collection.watch([]);
-              await initIteratorMode(changeStream);
-
-              // on 3.6 servers, no postBatchResumeToken is sent back in the initial aggregate response.
-              // This means that a resume token isn't cached until the first change has been iterated.
-              // In order to test the resume, we need to ensure that at least one document has
-              // been iterated so we have a resume token to resume on.
-              await collection.insertOne({ name: 'bailey' });
-              await changeStream.next();
-
-              const mock = sinon
-                // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-                .stub(changeStream.cursor.server!, 'getMore')
-                .callsFake((_ns, _cursorId, _options, callback) => {
-                  mock.restore();
-                  const error = new MongoServerError({ message: 'Something went wrong' });
-                  error.code = code;
-                  callback(error);
-                });
-
-              await collection.insertOne({ name: 'bailey' });
-
-              const hasNext = await changeStream.hasNext();
-              expect(hasNext).to.be.true;
-
-              expect(aggregateEvents).to.have.lengthOf(2);
-            }
-          );
-        }
-
-        it(
-          'maintains change stream options on resume',
-          { requires: { topology: '!single', mongodb: '>=4.2' } },
-          async function () {
-            changeStream = collection.watch([], changeStreamResumeOptions);
-            await initIteratorMode(changeStream);
-
-            await client.db('admin').command({
-              configureFailPoint: is4_2Server(this.configuration.version)
-                ? 'failCommand'
-                : 'failGetMoreAfterCursorCheckout',
-              mode: { times: 1 },
-              data: {
-                failCommands: ['getMore'],
-                errorCode: resumableErrorCodes[0].code
-              }
-            } as FailPoint);
-
-            expect(changeStream.cursor)
-              .to.have.property('options')
-              .that.containSubset(changeStreamResumeOptions);
-
-            await collection.insertOne({ name: 'bailey' });
-
-            await changeStream.hasNext();
-
-            expect(changeStream.cursor)
-              .to.have.property('options')
-              .that.containSubset(changeStreamResumeOptions);
-          }
-        );
-
-        context('when the error is not a resumable error', function () {
-          it(
-            'does not resume',
-            { requires: { topology: '!single', mongodb: '>=4.2' } },
-            async function () {
-              changeStream = collection.watch([]);
-
-              const unresumableErrorCode = 1000;
-              await client.db('admin').command({
-                configureFailPoint: is4_2Server(this.configuration.version)
-                  ? 'failCommand'
-                  : 'failGetMoreAfterCursorCheckout',
-                mode: { times: 1 },
-                data: {
-                  failCommands: ['getMore'],
-                  errorCode: unresumableErrorCode
-                }
-              } as FailPoint);
-
-              await initIteratorMode(changeStream);
-
-              await collection.insertOne({ name: 'bailey' });
-
-              const error = await changeStream.hasNext().catch(err => err);
-
-              expect(error).to.be.instanceOf(MongoServerError);
-              expect(aggregateEvents).to.have.lengthOf(1);
-            }
-          );
-        });
-      });
-
-      context('#tryNext', function () {
-        for (const { error, code } of resumableErrorCodes) {
-          it(
-            `resumes on error code ${code} (${error})`,
-            { requires: { topology: '!single', mongodb: '>=4.2' } },
-            async function () {
-              changeStream = collection.watch([]);
-              await initIteratorMode(changeStream);
-
-              await client.db('admin').command({
-                configureFailPoint: is4_2Server(this.configuration.version)
-                  ? 'failCommand'
-                  : 'failGetMoreAfterCursorCheckout',
-                mode: { times: 1 },
-                data: {
-                  failCommands: ['getMore'],
-                  errorCode: code
-                }
-              } as FailPoint);
-
-              try {
-                // tryNext is not blocking and on sharded clusters we don't have control of when
-                // the actual change event will be ready on the change stream pipeline. This introduces
-                // a race condition, where sometimes we receive the change event and sometimes
-                // we don't when we call tryNext, depending on the timing of the sharded cluster.
-
-                // Since we really only care about the resumability, it's enough for this test to throw
-                // if tryNext ever throws and assert on the number of aggregate events.
-                await changeStream.tryNext();
-              } catch (err) {
-                expect.fail(`expected tryNext to resume, received error instead: ${err}`);
-              }
-              expect(aggregateEvents).to.have.lengthOf(2);
-            }
-          );
-        }
-
-        for (const { error, code } of resumableErrorCodes) {
-          it(
-            `resumes on error code ${code} (${error})`,
-            { requires: { topology: '!single', mongodb: '<4.2' } },
-            async function () {
-              changeStream = collection.watch([]);
-              await initIteratorMode(changeStream);
-
-              // on 3.6 servers, no postBatchResumeToken is sent back in the initial aggregate response.
-              // This means that a resume token isn't cached until the first change has been iterated.
-              // In order to test the resume, we need to ensure that at least one document has
-              // been iterated so we have a resume token to resume on.
-              await collection.insertOne({ name: 'bailey' });
-              await changeStream.next();
-
-              const mock = sinon
-                // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-                .stub(changeStream.cursor.server!, 'getMore')
-                .callsFake((_ns, _cursorId, _options, callback) => {
-                  mock.restore();
-                  const error = new MongoServerError({ message: 'Something went wrong' });
-                  error.code = code;
-                  callback(error);
-                });
-
-              try {
-                // tryNext is not blocking and on sharded clusters we don't have control of when
-                // the actual change event will be ready on the change stream pipeline. This introduces
-                // a race condition, where sometimes we receive the change event and sometimes
-                // we don't when we call tryNext, depending on the timing of the sharded cluster.
-
-                // Since we really only care about the resumability, it's enough for this test to throw
-                // if tryNext ever throws and assert on the number of aggregate events.
-                await changeStream.tryNext();
-              } catch (err) {
-                expect.fail(`expected tryNext to resume, received error instead: ${err}`);
-              }
-              expect(aggregateEvents).to.have.lengthOf(2);
-            }
-          );
-        }
-
-        it(
-          'maintains change stream options on resume',
-          { requires: { topology: '!single', mongodb: '>=4.2' } },
-          async function () {
-            changeStream = collection.watch([], changeStreamResumeOptions);
-            await initIteratorMode(changeStream);
-
-            await client.db('admin').command({
-              configureFailPoint: is4_2Server(this.configuration.version)
-                ? 'failCommand'
-                : 'failGetMoreAfterCursorCheckout',
-              mode: { times: 1 },
-              data: {
-                failCommands: ['getMore'],
-                errorCode: resumableErrorCodes[0].code
-              }
-            } as FailPoint);
-
-            expect(changeStream.cursor)
-              .to.have.property('options')
-              .that.containSubset(changeStreamResumeOptions);
-
-            await collection.insertOne({ name: 'bailey' });
-
-            await changeStream.tryNext();
-
-            expect(changeStream.cursor)
-              .to.have.property('options')
-              .that.containSubset(changeStreamResumeOptions);
-          }
-        );
-
-        context('when the error is not a resumable error', function () {
-          it(
-            'does not resume',
-            { requires: { topology: '!single', mongodb: '>=4.2' } },
-            async function () {
-              changeStream = collection.watch([]);
-
-              const unresumableErrorCode = 1000;
-              await client.db('admin').command({
-                configureFailPoint: is4_2Server(this.configuration.version)
-                  ? 'failCommand'
-                  : 'failGetMoreAfterCursorCheckout',
-                mode: { times: 1 },
-                data: {
-                  failCommands: ['getMore'],
-                  errorCode: unresumableErrorCode
-                }
-              } as FailPoint);
-
-              await initIteratorMode(changeStream);
-
-              const error = await changeStream.tryNext().catch(err => err);
-
-              expect(error).to.be.instanceOf(MongoServerError);
-              expect(aggregateEvents).to.have.lengthOf(1);
-            }
-          );
-        });
-      });
-    });
-
-    describe('event emitter based iteration', function () {
+});
+
+describe('ChangeStream resumability', function () {
+  let client: MongoClient;
+  let collection: Collection;
+  let changeStream: ChangeStream;
+  let aggregateEvents: CommandStartedEvent[] = [];
+
+  const changeStreamResumeOptions: ChangeStreamOptions = {
+    fullDocument: 'updateLookup',
+    collation: { locale: 'en', maxVariable: 'punct' },
+    maxAwaitTimeMS: 20000,
+    batchSize: 200
+  };
+
+  const resumableErrorCodes = [
+    { error: 'HostUnreachable', code: 6 },
+    { error: 'HostNotFound', code: 7 },
+    { error: 'NetworkTimeout', code: 89 },
+    { error: 'ShutdownInProgress', code: 91 },
+    { error: 'PrimarySteppedDown', code: 189 },
+    { error: 'ExceededTimeLimit', code: 262 },
+    { error: 'SocketException', code: 9001 },
+    { error: 'NotWritablePrimary', code: 10107 },
+    { error: 'InterruptedAtShutdown', code: 11600 },
+    { error: 'InterruptedDueToReplStateChange', code: 11602 },
+    { error: 'NotPrimaryNoSecondaryOk', code: 13435 },
+    { error: 'StaleShardVersion', code: 63 },
+    { error: 'StaleEpoch', code: 150 },
+    { error: 'RetryChangeStream', code: 234 },
+    { error: 'FailedToSatisfyReadPreference', code: 133 },
+    { error: 'CursorNotFound', code: 43 }
+  ];
+
+  const is4_2Server = (serverVersion: string) =>
+    gte(serverVersion, '4.2.0') && lt(serverVersion, '4.3.0');
+
+  beforeEach(async function () {
+    const dbName = 'resumabilty_tests';
+    const collectionName = 'foo';
+    const utilClient = this.configuration.newClient();
+    // 3.6 servers do not support creating a change stream on a database that doesn't exist
+    await utilClient
+      .db(dbName)
+      .dropDatabase()
+      .catch(e => e);
+    await utilClient.db(dbName).createCollection(collectionName);
+    await utilClient.close();
+
+    client = this.configuration.newClient({ monitorCommands: true });
+    client.on('commandStarted', filterForCommands(['aggregate'], aggregateEvents));
+    collection = client.db(dbName).collection(collectionName);
+  });
+
+  afterEach(async function () {
+    await changeStream.close();
+    await client.close();
+    aggregateEvents = [];
+  });
+
+  context('iterator api', function () {
+    context('#next', function () {
       for (const { error, code } of resumableErrorCodes) {
         it(
           `resumes on error code ${code} (${error})`,
           { requires: { topology: '!single', mongodb: '>=4.2' } },
           async function () {
             changeStream = collection.watch([]);
+            await initIteratorMode(changeStream);
 
             await client.db('admin').command({
               configureFailPoint: is4_2Server(this.configuration.version)
@@ -2035,24 +1638,56 @@ describe('Change Streams', function () {
               }
             } as FailPoint);
 
-            const changes = once(changeStream, 'change');
-            await once(changeStream.cursor, 'init');
-
             await collection.insertOne({ name: 'bailey' });
 
-            const [change] = await changes;
+            const change = await changeStream.next();
             expect(change).to.have.property('operationType', 'insert');
 
             expect(aggregateEvents).to.have.lengthOf(2);
           }
         );
       }
+      for (const { error, code } of resumableErrorCodes) {
+        it(
+          `resumes on error code ${code} (${error})`,
+          { requires: { topology: '!single', mongodb: '<4.2' } },
+          async function () {
+            changeStream = collection.watch([]);
+            await initIteratorMode(changeStream);
+
+            // on 3.6 servers, no postBatchResumeToken is sent back in the initial aggregate response.
+            // This means that a resume token isn't cached until the first change has been iterated.
+            // In order to test the resume, we need to ensure that at least one document has
+            // been iterated so we have a resume token to resume on.
+            await collection.insertOne({ name: 'bailey' });
+            await changeStream.next();
+
+            const mock = sinon
+              // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+              .stub(changeStream.cursor.server!, 'getMore')
+              .callsFake((_ns, _cursorId, _options, callback) => {
+                mock.restore();
+                const error = new MongoServerError({ message: 'Something went wrong' });
+                error.code = code;
+                callback(error);
+              });
+
+            await collection.insertOne({ name: 'bailey' });
+
+            const change = await changeStream.next();
+
+            expect(change).to.have.property('operationType', 'insert');
+            expect(aggregateEvents).to.have.lengthOf(2);
+          }
+        );
+      }
 
       it(
-        'maintains the change stream options on resume',
+        'maintains change stream options on resume',
         { requires: { topology: '!single', mongodb: '>=4.2' } },
         async function () {
           changeStream = collection.watch([], changeStreamResumeOptions);
+          await initIteratorMode(changeStream);
 
           await client.db('admin').command({
             configureFailPoint: is4_2Server(this.configuration.version)
@@ -2069,12 +1704,9 @@ describe('Change Streams', function () {
             .to.have.property('options')
             .that.containSubset(changeStreamResumeOptions);
 
-          const changes = once(changeStream, 'change');
-          await once(changeStream.cursor, 'init');
-
           await collection.insertOne({ name: 'bailey' });
 
-          await changes;
+          await changeStream.next();
 
           expect(changeStream.cursor)
             .to.have.property('options')
@@ -2101,11 +1733,11 @@ describe('Change Streams', function () {
               }
             } as FailPoint);
 
-            const willBeError = once(changeStream, 'change').catch(error => error);
-            await once(changeStream.cursor, 'init');
+            await initIteratorMode(changeStream);
+
             await collection.insertOne({ name: 'bailey' });
 
-            const error = await willBeError;
+            const error = await changeStream.next().catch(err => err);
 
             expect(error).to.be.instanceOf(MongoServerError);
             expect(aggregateEvents).to.have.lengthOf(1);
@@ -2114,53 +1746,421 @@ describe('Change Streams', function () {
       });
     });
 
-    it(
-      'caches the server version after the initial aggregate call',
-      { requires: { topology: '!single' } },
-      async function () {
-        changeStream = collection.watch([], changeStreamResumeOptions);
-        expect(changeStream.cursor.maxWireVersion).to.be.undefined;
-        await initIteratorMode(changeStream);
+    context('#hasNext', function () {
+      for (const { error, code } of resumableErrorCodes) {
+        it(
+          `resumes on error code ${code} (${error})`,
+          { requires: { topology: '!single', mongodb: '>=4.2' } },
+          async function () {
+            changeStream = collection.watch([]);
+            await initIteratorMode(changeStream);
 
-        expect(changeStream.cursor.maxWireVersion).to.be.a('number');
+            await client.db('admin').command({
+              configureFailPoint: is4_2Server(this.configuration.version)
+                ? 'failCommand'
+                : 'failGetMoreAfterCursorCheckout',
+              mode: { times: 1 },
+              data: {
+                failCommands: ['getMore'],
+                errorCode: code
+              }
+            } as FailPoint);
+
+            await collection.insertOne({ name: 'bailey' });
+
+            const hasNext = await changeStream.hasNext();
+            expect(hasNext).to.be.true;
+
+            expect(aggregateEvents).to.have.lengthOf(2);
+          }
+        );
       }
-    );
 
-    it(
-      'updates the cached server version after the first getMore call',
-      { requires: { topology: '!single' } },
-      async function () {
-        changeStream = collection.watch([], changeStreamResumeOptions);
-        await initIteratorMode(changeStream);
+      for (const { error, code } of resumableErrorCodes) {
+        it(
+          `resumes on error code ${code} (${error})`,
+          { requires: { topology: '!single', mongodb: '<4.2' } },
+          async function () {
+            changeStream = collection.watch([]);
+            await initIteratorMode(changeStream);
 
-        const maxWireVersion = changeStream.cursor.maxWireVersion;
-        changeStream.cursor.maxWireVersion = -1;
+            // on 3.6 servers, no postBatchResumeToken is sent back in the initial aggregate response.
+            // This means that a resume token isn't cached until the first change has been iterated.
+            // In order to test the resume, we need to ensure that at least one document has
+            // been iterated so we have a resume token to resume on.
+            await collection.insertOne({ name: 'bailey' });
+            await changeStream.next();
 
-        await changeStream.tryNext();
+            const mock = sinon
+              // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+              .stub(changeStream.cursor.server!, 'getMore')
+              .callsFake((_ns, _cursorId, _options, callback) => {
+                mock.restore();
+                const error = new MongoServerError({ message: 'Something went wrong' });
+                error.code = code;
+                callback(error);
+              });
 
-        expect(changeStream.cursor.maxWireVersion).equal(maxWireVersion);
+            await collection.insertOne({ name: 'bailey' });
+
+            const hasNext = await changeStream.hasNext();
+            expect(hasNext).to.be.true;
+
+            expect(aggregateEvents).to.have.lengthOf(2);
+          }
+        );
       }
-    );
 
-    it(
-      'updates the cached server version after each getMore call',
-      { requires: { topology: '!single' } },
-      async function () {
-        changeStream = collection.watch([], changeStreamResumeOptions);
-        await initIteratorMode(changeStream);
+      it(
+        'maintains change stream options on resume',
+        { requires: { topology: '!single', mongodb: '>=4.2' } },
+        async function () {
+          changeStream = collection.watch([], changeStreamResumeOptions);
+          await initIteratorMode(changeStream);
 
-        const maxWireVersion = changeStream.cursor.maxWireVersion;
-        changeStream.cursor.maxWireVersion = -1;
+          await client.db('admin').command({
+            configureFailPoint: is4_2Server(this.configuration.version)
+              ? 'failCommand'
+              : 'failGetMoreAfterCursorCheckout',
+            mode: { times: 1 },
+            data: {
+              failCommands: ['getMore'],
+              errorCode: resumableErrorCodes[0].code
+            }
+          } as FailPoint);
 
-        await changeStream.tryNext();
+          expect(changeStream.cursor)
+            .to.have.property('options')
+            .that.containSubset(changeStreamResumeOptions);
 
-        expect(changeStream.cursor.maxWireVersion).equal(maxWireVersion);
+          await collection.insertOne({ name: 'bailey' });
 
-        changeStream.cursor.maxWireVersion = -1;
+          await changeStream.hasNext();
 
-        await changeStream.tryNext();
-        expect(changeStream.cursor.maxWireVersion).equal(maxWireVersion);
+          expect(changeStream.cursor)
+            .to.have.property('options')
+            .that.containSubset(changeStreamResumeOptions);
+        }
+      );
+
+      context('when the error is not a resumable error', function () {
+        it(
+          'does not resume',
+          { requires: { topology: '!single', mongodb: '>=4.2' } },
+          async function () {
+            changeStream = collection.watch([]);
+
+            const unresumableErrorCode = 1000;
+            await client.db('admin').command({
+              configureFailPoint: is4_2Server(this.configuration.version)
+                ? 'failCommand'
+                : 'failGetMoreAfterCursorCheckout',
+              mode: { times: 1 },
+              data: {
+                failCommands: ['getMore'],
+                errorCode: unresumableErrorCode
+              }
+            } as FailPoint);
+
+            await initIteratorMode(changeStream);
+
+            await collection.insertOne({ name: 'bailey' });
+
+            const error = await changeStream.hasNext().catch(err => err);
+
+            expect(error).to.be.instanceOf(MongoServerError);
+            expect(aggregateEvents).to.have.lengthOf(1);
+          }
+        );
+      });
+    });
+
+    context('#tryNext', function () {
+      for (const { error, code } of resumableErrorCodes) {
+        it(
+          `resumes on error code ${code} (${error})`,
+          { requires: { topology: '!single', mongodb: '>=4.2' } },
+          async function () {
+            changeStream = collection.watch([]);
+            await initIteratorMode(changeStream);
+
+            await client.db('admin').command({
+              configureFailPoint: is4_2Server(this.configuration.version)
+                ? 'failCommand'
+                : 'failGetMoreAfterCursorCheckout',
+              mode: { times: 1 },
+              data: {
+                failCommands: ['getMore'],
+                errorCode: code
+              }
+            } as FailPoint);
+
+            try {
+              // tryNext is not blocking and on sharded clusters we don't have control of when
+              // the actual change event will be ready on the change stream pipeline. This introduces
+              // a race condition, where sometimes we receive the change event and sometimes
+              // we don't when we call tryNext, depending on the timing of the sharded cluster.
+
+              // Since we really only care about the resumability, it's enough for this test to throw
+              // if tryNext ever throws and assert on the number of aggregate events.
+              await changeStream.tryNext();
+            } catch (err) {
+              expect.fail(`expected tryNext to resume, received error instead: ${err}`);
+            }
+            expect(aggregateEvents).to.have.lengthOf(2);
+          }
+        );
       }
-    );
+
+      for (const { error, code } of resumableErrorCodes) {
+        it(
+          `resumes on error code ${code} (${error})`,
+          { requires: { topology: '!single', mongodb: '<4.2' } },
+          async function () {
+            changeStream = collection.watch([]);
+            await initIteratorMode(changeStream);
+
+            // on 3.6 servers, no postBatchResumeToken is sent back in the initial aggregate response.
+            // This means that a resume token isn't cached until the first change has been iterated.
+            // In order to test the resume, we need to ensure that at least one document has
+            // been iterated so we have a resume token to resume on.
+            await collection.insertOne({ name: 'bailey' });
+            await changeStream.next();
+
+            const mock = sinon
+              // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+              .stub(changeStream.cursor.server!, 'getMore')
+              .callsFake((_ns, _cursorId, _options, callback) => {
+                mock.restore();
+                const error = new MongoServerError({ message: 'Something went wrong' });
+                error.code = code;
+                callback(error);
+              });
+
+            try {
+              // tryNext is not blocking and on sharded clusters we don't have control of when
+              // the actual change event will be ready on the change stream pipeline. This introduces
+              // a race condition, where sometimes we receive the change event and sometimes
+              // we don't when we call tryNext, depending on the timing of the sharded cluster.
+
+              // Since we really only care about the resumability, it's enough for this test to throw
+              // if tryNext ever throws and assert on the number of aggregate events.
+              await changeStream.tryNext();
+            } catch (err) {
+              expect.fail(`expected tryNext to resume, received error instead: ${err}`);
+            }
+            expect(aggregateEvents).to.have.lengthOf(2);
+          }
+        );
+      }
+
+      it(
+        'maintains change stream options on resume',
+        { requires: { topology: '!single', mongodb: '>=4.2' } },
+        async function () {
+          changeStream = collection.watch([], changeStreamResumeOptions);
+          await initIteratorMode(changeStream);
+
+          await client.db('admin').command({
+            configureFailPoint: is4_2Server(this.configuration.version)
+              ? 'failCommand'
+              : 'failGetMoreAfterCursorCheckout',
+            mode: { times: 1 },
+            data: {
+              failCommands: ['getMore'],
+              errorCode: resumableErrorCodes[0].code
+            }
+          } as FailPoint);
+
+          expect(changeStream.cursor)
+            .to.have.property('options')
+            .that.containSubset(changeStreamResumeOptions);
+
+          await collection.insertOne({ name: 'bailey' });
+
+          await changeStream.tryNext();
+
+          expect(changeStream.cursor)
+            .to.have.property('options')
+            .that.containSubset(changeStreamResumeOptions);
+        }
+      );
+
+      context('when the error is not a resumable error', function () {
+        it(
+          'does not resume',
+          { requires: { topology: '!single', mongodb: '>=4.2' } },
+          async function () {
+            changeStream = collection.watch([]);
+
+            const unresumableErrorCode = 1000;
+            await client.db('admin').command({
+              configureFailPoint: is4_2Server(this.configuration.version)
+                ? 'failCommand'
+                : 'failGetMoreAfterCursorCheckout',
+              mode: { times: 1 },
+              data: {
+                failCommands: ['getMore'],
+                errorCode: unresumableErrorCode
+              }
+            } as FailPoint);
+
+            await initIteratorMode(changeStream);
+
+            const error = await changeStream.tryNext().catch(err => err);
+
+            expect(error).to.be.instanceOf(MongoServerError);
+            expect(aggregateEvents).to.have.lengthOf(1);
+          }
+        );
+      });
+    });
   });
+
+  describe('event emitter based iteration', function () {
+    for (const { error, code } of resumableErrorCodes) {
+      it(
+        `resumes on error code ${code} (${error})`,
+        { requires: { topology: '!single', mongodb: '>=4.2' } },
+        async function () {
+          changeStream = collection.watch([]);
+
+          await client.db('admin').command({
+            configureFailPoint: is4_2Server(this.configuration.version)
+              ? 'failCommand'
+              : 'failGetMoreAfterCursorCheckout',
+            mode: { times: 1 },
+            data: {
+              failCommands: ['getMore'],
+              errorCode: code
+            }
+          } as FailPoint);
+
+          const changes = once(changeStream, 'change');
+          await once(changeStream.cursor, 'init');
+
+          await collection.insertOne({ name: 'bailey' });
+
+          const [change] = await changes;
+          expect(change).to.have.property('operationType', 'insert');
+
+          expect(aggregateEvents).to.have.lengthOf(2);
+        }
+      );
+    }
+
+    it(
+      'maintains the change stream options on resume',
+      { requires: { topology: '!single', mongodb: '>=4.2' } },
+      async function () {
+        changeStream = collection.watch([], changeStreamResumeOptions);
+
+        await client.db('admin').command({
+          configureFailPoint: is4_2Server(this.configuration.version)
+            ? 'failCommand'
+            : 'failGetMoreAfterCursorCheckout',
+          mode: { times: 1 },
+          data: {
+            failCommands: ['getMore'],
+            errorCode: resumableErrorCodes[0].code
+          }
+        } as FailPoint);
+
+        expect(changeStream.cursor)
+          .to.have.property('options')
+          .that.containSubset(changeStreamResumeOptions);
+
+        const changes = once(changeStream, 'change');
+        await once(changeStream.cursor, 'init');
+
+        await collection.insertOne({ name: 'bailey' });
+
+        await changes;
+
+        expect(changeStream.cursor)
+          .to.have.property('options')
+          .that.containSubset(changeStreamResumeOptions);
+      }
+    );
+
+    context('when the error is not a resumable error', function () {
+      it(
+        'does not resume',
+        { requires: { topology: '!single', mongodb: '>=4.2' } },
+        async function () {
+          changeStream = collection.watch([]);
+
+          const unresumableErrorCode = 1000;
+          await client.db('admin').command({
+            configureFailPoint: is4_2Server(this.configuration.version)
+              ? 'failCommand'
+              : 'failGetMoreAfterCursorCheckout',
+            mode: { times: 1 },
+            data: {
+              failCommands: ['getMore'],
+              errorCode: unresumableErrorCode
+            }
+          } as FailPoint);
+
+          const willBeError = once(changeStream, 'change').catch(error => error);
+          await once(changeStream.cursor, 'init');
+          await collection.insertOne({ name: 'bailey' });
+
+          const error = await willBeError;
+
+          expect(error).to.be.instanceOf(MongoServerError);
+          expect(aggregateEvents).to.have.lengthOf(1);
+        }
+      );
+    });
+  });
+
+  it(
+    'caches the server version after the initial aggregate call',
+    { requires: { topology: '!single' } },
+    async function () {
+      changeStream = collection.watch([], changeStreamResumeOptions);
+      expect(changeStream.cursor.maxWireVersion).to.be.undefined;
+      await initIteratorMode(changeStream);
+
+      expect(changeStream.cursor.maxWireVersion).to.be.a('number');
+    }
+  );
+
+  it(
+    'updates the cached server version after the first getMore call',
+    { requires: { topology: '!single' } },
+    async function () {
+      changeStream = collection.watch([], changeStreamResumeOptions);
+      await initIteratorMode(changeStream);
+
+      const maxWireVersion = changeStream.cursor.maxWireVersion;
+      changeStream.cursor.maxWireVersion = -1;
+
+      await changeStream.tryNext();
+
+      expect(changeStream.cursor.maxWireVersion).equal(maxWireVersion);
+    }
+  );
+
+  it(
+    'updates the cached server version after each getMore call',
+    { requires: { topology: '!single' } },
+    async function () {
+      changeStream = collection.watch([], changeStreamResumeOptions);
+      await initIteratorMode(changeStream);
+
+      const maxWireVersion = changeStream.cursor.maxWireVersion;
+      changeStream.cursor.maxWireVersion = -1;
+
+      await changeStream.tryNext();
+
+      expect(changeStream.cursor.maxWireVersion).equal(maxWireVersion);
+
+      changeStream.cursor.maxWireVersion = -1;
+
+      await changeStream.tryNext();
+      expect(changeStream.cursor.maxWireVersion).equal(maxWireVersion);
+    }
+  );
 });
