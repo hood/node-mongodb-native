@@ -80,6 +80,7 @@ export interface AbstractCursorOptions extends BSONSerializeOptions {
   readConcern?: ReadConcernLike;
   batchSize?: number;
   maxTimeMS?: number;
+  maxAwaitTimeMS?: number;
   /**
    * Comment to apply to the operation.
    *
@@ -182,8 +183,8 @@ export abstract class AbstractCursor<
       this[kOptions].comment = options.comment;
     }
 
-    if (typeof options.maxTimeMS === 'number') {
-      this[kOptions].maxTimeMS = options.maxTimeMS;
+    if (typeof options.maxTimeMS === 'number' || typeof options.maxAwaitTimeMS === 'number') {
+      this[kOptions].maxAwaitTimeMS = options.maxAwaitTimeMS ?? options.maxTimeMS;
     }
 
     if (options.session instanceof ClientSession) {
